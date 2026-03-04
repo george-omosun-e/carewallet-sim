@@ -69,18 +69,22 @@ export default function CarewalletClinicModel() {
   // Clinic chain facts
   const [monthlyConsults, setMonthlyConsults] = useState(95000);
   const clinicCount = 225;
+  const consultsPerGPPerDay = 32;
+  const workingDaysPerMonth = 22;
+  const maxCapacity = clinicCount * consultsPerGPPerDay * workingDaysPerMonth; // 158,400
   const totalHistoricConsults = 3_000_000;
 
   // Pricing
   const [cashPrice, setCashPrice] = useState(520);
   const [voucherPrice, setVoucherPrice] = useState(380);
   const [gpPayoutRate, setGpPayoutRate] = useState(290);
-  const platformFeePct = 10;
+  const [platformFeePct, setPlatformFeePct] = useState(10);
 
-  // Adoption
-  const [adoptionPct, setAdoptionPct] = useState(15);
+  // Capacity-based levers (v2 model)
+  const [emptySlotFillPct, setEmptySlotFillPct] = useState(20);
+  const [cannibalizationPct, setCannibalizationPct] = useState(5);
   const [vouchersPerUserMonth, setVouchersPerUserMonth] = useState(1);
-  const [monthlyAdoptionGrowth, setMonthlyAdoptionGrowth] = useState(3);
+  const [monthlyFillGrowth, setMonthlyFillGrowth] = useState(3);
 
   // Carewallet costs (lean)
   const infraCostUSD = 100;
@@ -91,6 +95,10 @@ export default function CarewalletClinicModel() {
   const [tab, setTab] = useState("case");
 
   const m = useMemo(() => {
+    // Derived capacity
+    const emptySlots = maxCapacity - monthlyConsults;
+    const utilization = monthlyConsults / maxCapacity;
+
     // Unit economics
     const consumerDiscount = cashPrice - voucherPrice;
     const consumerDiscountPct = consumerDiscount / cashPrice;
@@ -100,80 +108,88 @@ export default function CarewalletClinicModel() {
     const paymentProcessing = voucherPrice * 0.025;
     const netRevPerVoucher = totalRevPerVoucher - paymentProcessing;
 
-    // Clinic economics
-    const clinicRevenuePerConsultCash = cashPrice;
-    const clinicRevenuePerConsultVoucher = gpPayoutRate - platformFee;
-    const clinicNetLossPerVoucher = clinicRevenuePerConsultCash - clinicRevenuePerConsultVoucher;
+    // Clinic economics per voucher
+    const clinicNetPerVoucher = gpPayoutRate - platformFee;
+    const clinicCannibLossPerPatient = cashPrice - clinicNetPerVoucher;
 
-    // Volume
-    const voucherUsers = Math.round(monthlyConsults * (adoptionPct / 100));
-    const monthlyVouchersSold = voucherUsers * vouchersPerUserMonth;
-    const remainingCashConsults = monthlyConsults - monthlyVouchersSold;
+    // Month 1 volume
+    const newPatients = Math.round(emptySlots * (emptySlotFillPct / 100)) * vouchersPerUserMonth;
+    const cannibalized = Math.round(monthlyConsults * (cannibalizationPct / 100));
+    const repeatVisits = Math.round(newPatients * 0.08);
+    const totalVouchers = newPatients + cannibalized + repeatVisits;
+
+    // Month 1 Clinic P&L
+    const cashPatients = monthlyConsults - cannibalized;
+    const clinicCashRev = cashPatients * cashPrice;
+    const clinicVoucherRev = totalVouchers * clinicNetPerVoucher;
+    const clinicTotal = clinicCashRev + clinicVoucherRev;
+    const clinicBaseline = monthlyConsults * cashPrice;
+    const clinicDeltaM1 = clinicTotal - clinicBaseline;
+
+    // Clinic gain/cost breakdown
+    const clinicNewGain = newPatients * clinicNetPerVoucher;
+    const clinicRepeatGain = repeatVisits * clinicNetPerVoucher;
+    const clinicCannibLoss = cannibalized * clinicCannibLossPerPatient;
+    const clinicNetImpact = clinicNewGain + clinicRepeatGain - clinicCannibLoss;
 
     // Carewallet P&L
-    const monthlyGMV = monthlyVouchersSold * voucherPrice;
-    const monthlyGrossRev = monthlyVouchersSold * totalRevPerVoucher;
-    const monthlyNetRev = monthlyVouchersSold * netRevPerVoucher;
+    const monthlyGMV = totalVouchers * voucherPrice;
+    const monthlyGrossRev = totalVouchers * totalRevPerVoucher;
+    const monthlyNetRev = totalVouchers * netRevPerVoucher;
     const monthlyProfit = monthlyNetRev - totalMonthlyCostZAR;
+    const breakEvenVouchers = netRevPerVoucher > 0 ? Math.ceil(totalMonthlyCostZAR / netRevPerVoucher) : Infinity;
 
-    // Clinic value analysis — the argument for the clinic
-    // Current: all cash, but variable. Some patients don't return. Churn is high.
-    // With Carewallet: slightly less per voucher consult, BUT more repeat visits + new patients
     const currentMonthlyRevenue = monthlyConsults * cashPrice;
     const avgConsultsPerClinic = monthlyConsults / clinicCount;
 
-    // 12-month projection
+    // 12-month projection (capacity-based)
     const months = [];
-    let adoptPct = adoptionPct;
+    let fillPct = emptySlotFillPct;
     let cumCWProfit = 0;
     let breakEvenMonth = null;
 
     for (let i = 1; i <= 12; i++) {
-      if (i > 1) adoptPct = Math.min(adoptPct + monthlyAdoptionGrowth, 60);
-      const vUsers = Math.round(monthlyConsults * (adoptPct / 100));
-      const vSold = vUsers * vouchersPerUserMonth;
-      const cashConsults = monthlyConsults - vSold;
+      if (i > 1) fillPct = Math.min(fillPct + monthlyFillGrowth, 80);
 
-      // NEW patients attracted by voucher affordability (growth lever)
-      const newPatientsFromVoucher = Math.round(vSold * 0.12 * (i / 6)); // 12% of voucher users are net-new, growing
-      const totalConsultsWithGrowth = monthlyConsults + newPatientsFromVoucher;
-      
-      // Clinic revenue
-      const clinicCashRev = cashConsults * cashPrice;
-      const clinicVoucherRev = vSold * (gpPayoutRate - platformFee);
-      const clinicNewPatientRev = newPatientsFromVoucher * (gpPayoutRate - platformFee);
-      const clinicTotalRev = clinicCashRev + clinicVoucherRev + clinicNewPatientRev;
-      const clinicBaselineRev = monthlyConsults * cashPrice;
+      const moNewPatients = Math.round(emptySlots * (fillPct / 100)) * vouchersPerUserMonth;
+      const moCannibalized = cannibalized; // stays flat
+      const moRepeatVisits = Math.round(moNewPatients * 0.08);
+      const moTotalVouchers = moNewPatients + moCannibalized + moRepeatVisits;
 
-      // Repeat visit uplift: voucher patients visit more frequently
-      const repeatUplift = Math.round(vSold * 0.08); // 8% additional visits from voucher holders
-      const clinicRepeatRev = repeatUplift * (gpPayoutRate - platformFee);
-      const clinicTotalWithRepeat = clinicTotalRev + clinicRepeatRev;
+      // Clinic
+      const moCashPatients = monthlyConsults - moCannibalized;
+      const moClinicCashRev = moCashPatients * cashPrice;
+      const moClinicVoucherRev = moTotalVouchers * clinicNetPerVoucher;
+      const moClinicTotal = moClinicCashRev + moClinicVoucherRev;
+      const moClinicBaseline = monthlyConsults * cashPrice;
+      const moClinicDelta = moClinicTotal - moClinicBaseline;
 
       // Carewallet
-      const cwRev = (vSold + newPatientsFromVoucher + repeatUplift) * netRevPerVoucher;
-      const cwProfit = cwRev - totalMonthlyCostZAR;
-      cumCWProfit += cwProfit;
-      if (cwProfit > 0 && !breakEvenMonth) breakEvenMonth = i;
+      const moCWRev = moTotalVouchers * netRevPerVoucher;
+      const moCWProfit = moCWRev - totalMonthlyCostZAR;
+      cumCWProfit += moCWProfit;
+      if (moCWProfit > 0 && !breakEvenMonth) breakEvenMonth = i;
 
       months.push({
         month: i,
-        adoptPct,
-        voucherUsers: vUsers,
-        vouchersSold: vSold,
-        newPatients: newPatientsFromVoucher,
-        repeatUplift,
-        totalConsults: totalConsultsWithGrowth + repeatUplift,
-        clinicBaseline: clinicBaselineRev,
-        clinicActual: clinicTotalWithRepeat,
-        clinicDelta: clinicTotalWithRepeat - clinicBaselineRev,
-        cwRevenue: cwRev,
-        cwProfit,
+        fillPct,
+        newPatients: moNewPatients,
+        cannibalized: moCannibalized,
+        repeatVisits: moRepeatVisits,
+        totalVouchers: moTotalVouchers,
+        clinicBaseline: moClinicBaseline,
+        clinicActual: moClinicTotal,
+        clinicDelta: moClinicDelta,
+        cwRevenue: moCWRev,
+        cwProfit: moCWProfit,
         cumCWProfit,
       });
     }
 
     return {
+      emptySlots,
+      utilization,
+      maxCapacity,
       consumerDiscount,
       consumerDiscountPct,
       platformFee,
@@ -181,13 +197,21 @@ export default function CarewalletClinicModel() {
       totalRevPerVoucher,
       paymentProcessing,
       netRevPerVoucher,
-      clinicRevenuePerConsultVoucher,
-      voucherUsers,
-      monthlyVouchersSold,
+      clinicNetPerVoucher,
+      clinicCannibLossPerPatient,
+      newPatients,
+      cannibalized,
+      repeatVisits,
+      totalVouchers,
+      clinicNewGain,
+      clinicRepeatGain,
+      clinicCannibLoss,
+      clinicNetImpact,
       monthlyGMV,
       monthlyGrossRev,
       monthlyNetRev,
       monthlyProfit,
+      breakEvenVouchers,
       currentMonthlyRevenue,
       avgConsultsPerClinic,
       totalMonthlyCostZAR,
@@ -199,12 +223,12 @@ export default function CarewalletClinicModel() {
       month12ClinicDelta: months[11]?.clinicDelta || 0,
       month12ClinicPct: months[11] ? months[11].clinicActual / months[11].clinicBaseline - 1 : 0,
     };
-  }, [cashPrice, voucherPrice, gpPayoutRate, monthlyConsults, adoptionPct, vouchersPerUserMonth, monthlyAdoptionGrowth]);
+  }, [cashPrice, voucherPrice, gpPayoutRate, platformFeePct, monthlyConsults, emptySlotFillPct, cannibalizationPct, vouchersPerUserMonth, monthlyFillGrowth]);
 
   const tabs = [
     { id: "case", label: "1. Voucher Pricing" },
-    { id: "volume", label: "2. Users & Frequency" },
-    { id: "clinic", label: "3. Clinic P&L Impact" },
+    { id: "volume", label: "2. Capacity & Volume" },
+    { id: "clinic", label: "3. Clinic P\u0026L Impact" },
     { id: "projection", label: "4. 12-Month Comparison" },
     { id: "pitch", label: "5. Pitch Summary" },
   ];
@@ -228,7 +252,9 @@ export default function CarewalletClinicModel() {
           <div>
             <div style={{ fontSize: 10, letterSpacing: 2.5, color: "#10b981", textTransform: "uppercase", marginBottom: 4 }}>Business Case</div>
             <h1 style={{ margin: 0, fontSize: 24, fontWeight: 800, color: "#fafafa", letterSpacing: -0.5 }}>Carewallet × Clinic Chain</h1>
-            <div style={{ fontSize: 12, color: "#52525b", marginTop: 3 }}>225 clinics · {fmtNum(monthlyConsults)} consultations/mo · 3M+ historic records</div>
+            <div style={{ fontSize: 12, color: "#52525b", marginTop: 3 }}>
+              {clinicCount} clinics · {fmtNum(monthlyConsults)} consults/mo · {fmtNum(m.emptySlots)} empty slots · {pct(m.utilization)} utilization
+            </div>
           </div>
           <div style={{ textAlign: "right" }}>
             <div style={{ fontSize: 10, color: "#52525b" }}>Carewallet Monthly Burn</div>
@@ -256,8 +282,8 @@ export default function CarewalletClinicModel() {
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 24 }}>
         <Stat label="Consumer Saves" value={pct(m.consumerDiscountPct)} sub={`${fmtFull(m.consumerDiscount)} off R${cashPrice} cash`} color={m.consumerDiscountPct >= 0.20 ? "#10b981" : m.consumerDiscountPct >= 0.15 ? "#f59e0b" : "#ef4444"} size="large" />
         <Stat label="Carewallet Net / Voucher" value={fmtFull(m.netRevPerVoucher)} sub={`${pct(m.netRevPerVoucher / voucherPrice)} effective take`} color={m.netRevPerVoucher > 0 ? "#10b981" : "#ef4444"} size="large" />
-        <Stat label="Carewallet Monthly Profit" value={fmt(m.monthlyProfit)} sub={`on ${fmtNum(m.monthlyVouchersSold)} vouchers`} color={m.monthlyProfit > 0 ? "#10b981" : "#ef4444"} size="large" />
-        <Stat label="Break-even" value={m.breakEvenMonth ? `Month ${m.breakEvenMonth}` : "—"} sub={m.breakEvenMonth ? "from launch" : "Adjust levers"} color={m.breakEvenMonth && m.breakEvenMonth <= 3 ? "#10b981" : "#f59e0b"} size="large" />
+        <Stat label="Carewallet Monthly Profit" value={fmt(m.monthlyProfit)} sub={`on ${fmtNum(m.totalVouchers)} vouchers`} color={m.monthlyProfit > 0 ? "#10b981" : "#ef4444"} size="large" />
+        <Stat label="Break-even" value={m.breakEvenMonth ? `Month ${m.breakEvenMonth}` : "Month 1"} sub={m.totalVouchers >= m.breakEvenVouchers ? `Need ${fmtNum(m.breakEvenVouchers)} — have ${fmtNum(m.totalVouchers)}` : `Need ${fmtNum(m.breakEvenVouchers)} vouchers`} color={m.monthlyProfit > 0 ? "#10b981" : "#f59e0b"} size="large" />
       </div>
 
       {/* TAB 1: VOUCHER PRICING */}
@@ -266,12 +292,13 @@ export default function CarewalletClinicModel() {
           <div>
             <Block title="PRICING CONTROLS">
               <Slider label="Cash Walk-in Price" value={cashPrice} onChange={setCashPrice} min={350} max={650} step={10} prefix="R" note="What patients currently pay at this clinic chain" />
-              <Slider label="Voucher Price (consumer pays)" value={voucherPrice} onChange={setVoucherPrice} min={200} max={500} step={10} prefix="R" note="Must be attractive enough to change behavior" />
+              <Slider label="Voucher Price (consumer pays)" value={voucherPrice} onChange={setVoucherPrice} min={200} max={500} step={10} prefix="R" note="Must hit 20%+ discount to change behavior" />
               <Slider label="GP Payout (clinic receives)" value={gpPayoutRate} onChange={setGpPayoutRate} min={150} max={450} step={10} prefix="R" note="What Carewallet remits to the clinic per redemption" />
+              <Slider label="Platform Fee %" value={platformFeePct} onChange={setPlatformFeePct} min={3} max={20} step={1} suffix="%" note="Charged to clinic for CRM, analytics, booking tools" />
             </Block>
             <div style={{ background: "#18181b", border: "1px solid #27272a", borderRadius: 8, padding: 14 }}>
               <div style={{ fontSize: 11, fontWeight: 600, color: "#71717a", marginBottom: 10 }}>Platform fee to clinic</div>
-              <div style={{ fontSize: 28, fontWeight: 800, color: "#f59e0b", fontFamily: "var(--mono)" }}>10%</div>
+              <div style={{ fontSize: 28, fontWeight: 800, color: "#f59e0b", fontFamily: "var(--mono)" }}>{platformFeePct}%</div>
               <div style={{ fontSize: 11, color: "#52525b" }}>of GP payout rate = {fmtFull(m.platformFee)}/voucher</div>
               <div style={{ fontSize: 10, color: "#3f3f46", marginTop: 6 }}>Charged to clinic for CRM, retainership tools, patient data analytics, and booking infrastructure</div>
             </div>
@@ -284,8 +311,8 @@ export default function CarewalletClinicModel() {
                 <div style={{ display: "flex", alignItems: "center", gap: 0, marginBottom: 24 }}>
                   {[
                     { label: "Patient pays", amount: voucherPrice, color: "#3b82f6", width: 100 },
-                    { label: "→", amount: null, color: "#52525b", width: 20 },
-                    { label: "Clinic gets", amount: gpPayoutRate - m.platformFee, color: "#10b981", width: 100 },
+                    { label: "\u2192", amount: null, color: "#52525b", width: 20 },
+                    { label: "Clinic gets", amount: m.clinicNetPerVoucher, color: "#10b981", width: 100 },
                     { label: "+", amount: null, color: "#52525b", width: 15 },
                     { label: "Carewallet keeps", amount: m.netRevPerVoucher, color: "#f59e0b", width: 100 },
                   ].map((s, i) => (
@@ -306,9 +333,9 @@ export default function CarewalletClinicModel() {
                 <div style={{ marginBottom: 16 }}>
                   <div style={{ fontSize: 11, color: "#71717a", marginBottom: 8 }}>Breakdown per {fmtFull(voucherPrice)} voucher</div>
                   {[
-                    { label: "Clinic net receipt", value: gpPayoutRate - m.platformFee, color: "#10b981" },
-                    { label: "Platform fee (10%)", value: m.platformFee, color: "#f59e0b" },
-                    { label: "Spread (voucher − GP rate)", value: m.spread, color: "#3b82f6" },
+                    { label: "Clinic net receipt", value: m.clinicNetPerVoucher, color: "#10b981" },
+                    { label: `Platform fee (${platformFeePct}%)`, value: m.platformFee, color: "#f59e0b" },
+                    { label: "Spread (voucher - GP rate)", value: m.spread, color: "#3b82f6" },
                     { label: "Payment processing (2.5%)", value: -m.paymentProcessing, color: "#ef4444" },
                     { label: "Carewallet net revenue", value: m.netRevPerVoucher, color: "#10b981" },
                   ].map((row, i) => (
@@ -349,7 +376,7 @@ export default function CarewalletClinicModel() {
               </div>
             </Block>
 
-            <Block title="PRICE SENSITIVITY — WHAT THE MARKET TELLS US" accent="#3b82f6">
+            <Block title="PRICE SENSITIVITY \u2014 WHAT THE MARKET TELLS US" accent="#3b82f6">
               <div style={{ background: "#18181b", border: "1px solid #27272a", borderRadius: 8, padding: 14 }}>
                 <div style={{ fontSize: 11, color: "#a1a1aa", lineHeight: 1.6, marginBottom: 12 }}>
                   Discovery Prepaid Health proved the model at <strong style={{ color: "#3b82f6" }}>R300</strong> (incl. meds) vs ~R450-520 cash = 33-42% discount.
@@ -385,96 +412,120 @@ export default function CarewalletClinicModel() {
         </div>
       )}
 
-      {/* TAB 2: USERS & FREQUENCY */}
+      {/* TAB 2: CAPACITY & VOLUME (v2 model) */}
       {tab === "volume" && (
         <div style={{ display: "grid", gridTemplateColumns: "340px 1fr", gap: 20 }}>
           <div>
-            <Block title="ADOPTION CONTROLS">
-              <Slider label="Monthly Consultations (clinic chain)" value={monthlyConsults} onChange={setMonthlyConsults} min={75000} max={130000} step={5000} note="Total across 225 clinics" />
-              <Slider label="Voucher Adoption Rate" value={adoptionPct} onChange={setAdoptionPct} min={5} max={50} step={1} suffix="%" note="% of existing patients who switch to vouchers" />
+            <Block title="CAPACITY CONTROLS">
+              <Slider label="Monthly Consultations (actual)" value={monthlyConsults} onChange={setMonthlyConsults} min={75000} max={130000} step={5000} note={`Total across ${clinicCount} clinics (max capacity: ${fmtNum(maxCapacity)})`} />
+              <Slider label="Empty Slot Fill Rate" value={emptySlotFillPct} onChange={setEmptySlotFillPct} min={5} max={60} step={1} suffix="%" note="% of empty slots filled by voucher patients (new patients)" />
+              <Slider label="Cannibalization Rate" value={cannibalizationPct} onChange={setCannibalizationPct} min={0} max={15} step={1} suffix="%" note="% of existing cash patients who switch to vouchers" />
               <Slider label="Vouchers per User per Month" value={vouchersPerUserMonth} onChange={setVouchersPerUserMonth} min={1} max={4} step={1} note="Whole number: GP visits that month" />
-              <Slider label="Monthly Adoption Growth" value={monthlyAdoptionGrowth} onChange={setMonthlyAdoptionGrowth} min={1} max={8} step={0.5} suffix="% pts" note="How many more % of patients adopt each month" />
+              <Slider label="Monthly Fill Rate Growth" value={monthlyFillGrowth} onChange={setMonthlyFillGrowth} min={1} max={8} step={0.5} suffix="% pts" note="How fast vouchers fill more empty slots each month (caps at 80%)" />
             </Block>
           </div>
 
           <div>
-            <Block title="WHO NEEDS TO BUY, AND HOW OFTEN">
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 16 }}>
-                <Stat label="Monthly Consultations" value={fmtNum(monthlyConsults)} sub={`${clinicCount} clinics × ~${Math.round(monthlyConsults / clinicCount)}/clinic`} color="#3b82f6" />
-                <Stat label="Voucher Adopters" value={fmtNum(m.voucherUsers)} sub={`${adoptionPct}% of patients`} color="#10b981" />
-                <Stat label="Vouchers Sold / Month" value={fmtNum(m.monthlyVouchersSold)} sub={`${vouchersPerUserMonth} per user × ${fmtNum(m.voucherUsers)} users`} color="#f59e0b" />
+            {/* Utilization bar */}
+            <Block title="CLINIC CHAIN CAPACITY">
+              <div style={{ background: "#18181b", border: "1px solid #27272a", borderRadius: 8, padding: 16, marginBottom: 16 }}>
+                <div style={{ fontSize: 11, color: "#71717a", marginBottom: 10 }}>Monthly capacity utilization</div>
+                <div style={{ background: "#27272a", borderRadius: 6, height: 36, overflow: "hidden", position: "relative", marginBottom: 8 }}>
+                  <div style={{
+                    width: `${(monthlyConsults / maxCapacity) * 100}%`,
+                    height: "100%",
+                    background: "#3b82f6",
+                    position: "absolute",
+                    left: 0,
+                    borderRadius: "6px 0 0 6px",
+                  }} />
+                  <div style={{
+                    width: `${(m.newPatients / maxCapacity) * 100}%`,
+                    height: "100%",
+                    background: "#10b981",
+                    position: "absolute",
+                    left: `${(monthlyConsults / maxCapacity) * 100}%`,
+                  }} />
+                  <div style={{ position: "absolute", left: 8, top: "50%", transform: "translateY(-50%)", fontSize: 10, fontWeight: 700, color: "#fafafa" }}>
+                    {fmtNum(monthlyConsults)} current ({pct(m.utilization)})
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 16, fontSize: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <div style={{ width: 10, height: 10, background: "#3b82f6", borderRadius: 2 }} />
+                    <span style={{ color: "#a1a1aa" }}>Current cash patients ({fmtNum(monthlyConsults)})</span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <div style={{ width: 10, height: 10, background: "#10b981", borderRadius: 2 }} />
+                    <span style={{ color: "#a1a1aa" }}>New voucher patients ({fmtNum(m.newPatients)})</span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <div style={{ width: 10, height: 10, background: "#27272a", borderRadius: 2 }} />
+                    <span style={{ color: "#71717a" }}>Still empty ({fmtNum(m.emptySlots - m.newPatients)})</span>
+                  </div>
+                </div>
               </div>
 
-              {/* The key number */}
-              <div style={{
-                background: "rgba(16,185,129,0.06)",
-                border: "2px solid rgba(16,185,129,0.3)",
-                borderRadius: 10, padding: 20, textAlign: "center", marginBottom: 16,
-              }}>
-                <div style={{ fontSize: 11, color: "#10b981", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>To hit profitability, Carewallet needs</div>
-                <div style={{ fontSize: 36, fontWeight: 800, color: "#fafafa", fontFamily: "var(--mono)" }}>
-                  {m.netRevPerVoucher > 0 ? fmtNum(Math.ceil(m.totalMonthlyCostZAR / m.netRevPerVoucher)) : "—"}
-                </div>
-                <div style={{ fontSize: 12, color: "#a1a1aa" }}>vouchers per month to cover R{Math.round(m.totalMonthlyCostZAR).toLocaleString()} burn</div>
-                <div style={{ fontSize: 12, color: "#52525b", marginTop: 6 }}>
-                  That's just <span style={{ color: "#10b981", fontWeight: 700 }}>
-                    {m.netRevPerVoucher > 0 ? pct(Math.ceil(m.totalMonthlyCostZAR / m.netRevPerVoucher) / monthlyConsults) : "—"}
-                  </span> of this clinic chain's monthly volume
-                </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10, marginBottom: 16 }}>
+                <Stat label="Max Capacity" value={fmtNum(maxCapacity)} sub={`${clinicCount} \u00d7 ${consultsPerGPPerDay} \u00d7 ${workingDaysPerMonth} days`} color="#71717a" />
+                <Stat label="Empty Slots" value={fmtNum(m.emptySlots)} sub={`${pct(1 - m.utilization)} unused`} color="#f59e0b" />
+                <Stat label="New Patients (voucher)" value={fmtNum(m.newPatients)} sub={`${emptySlotFillPct}% of empty slots filled`} color="#10b981" />
+                <Stat label="Cannibalized" value={fmtNum(m.cannibalized)} sub={`${cannibalizationPct}% of cash switch`} color="#ef4444" />
               </div>
+            </Block>
 
-              {/* Scenario grid */}
-              <Block title="SCENARIO MATRIX — Vouchers needed for breakeven" accent="#f59e0b">
-                <div style={{ background: "#18181b", border: "1px solid #27272a", borderRadius: 8, padding: 14, overflowX: "auto" }}>
-                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, fontFamily: "var(--mono)" }}>
-                    <thead>
-                      <tr>
-                        <th style={{ padding: "6px 4px", textAlign: "left", color: "#52525b", fontSize: 10 }}>Adoption ↓ / Freq →</th>
-                        {[1, 2, 3].map(f => (
-                          <th key={f} style={{ padding: "6px 4px", textAlign: "right", color: f === vouchersPerUserMonth ? "#f59e0b" : "#71717a", fontSize: 10 }}>{f} visit{f > 1 ? "s" : ""}/mo</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {[5, 10, 15, 20, 30].map(a => (
-                        <tr key={a} style={{ borderTop: "1px solid #27272a" }}>
-                          <td style={{ padding: "6px 4px", color: a === adoptionPct ? "#10b981" : "#a1a1aa", fontWeight: a === adoptionPct ? 700 : 400 }}>{a}% ({fmtNum(Math.round(monthlyConsults * a / 100))} users)</td>
-                          {[1, 2, 3].map(f => {
-                            const vouchers = Math.round(monthlyConsults * (a / 100)) * f;
-                            const rev = vouchers * m.netRevPerVoucher;
-                            const profit = rev - m.totalMonthlyCostZAR;
-                            const isActive = a === adoptionPct && f === vouchersPerUserMonth;
-                            return (
-                              <td key={f} style={{
-                                padding: "6px 4px", textAlign: "right",
-                                color: profit > 0 ? "#10b981" : "#ef4444",
-                                fontWeight: isActive ? 800 : 400,
-                                background: isActive ? "rgba(16,185,129,0.08)" : "transparent",
-                                borderRadius: isActive ? 4 : 0,
-                              }}>
-                                {fmt(profit)}/mo
-                              </td>
-                            );
-                          })}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+            {/* The clinic equation */}
+            <Block title="THE CLINIC EQUATION \u2014 GAIN vs COST" accent="#f59e0b">
+              <div style={{ background: "#18181b", border: "1px solid #27272a", borderRadius: 8, padding: 16 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr auto 1fr auto 1fr", gap: 12, alignItems: "center", marginBottom: 16 }}>
+                  <div style={{ textAlign: "center", padding: 12, background: "rgba(16,185,129,0.06)", border: "1px solid rgba(16,185,129,0.2)", borderRadius: 8 }}>
+                    <div style={{ fontSize: 10, color: "#10b981", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>GAIN: New Patients</div>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: "#10b981", fontFamily: "var(--mono)" }}>+{fmt(m.clinicNewGain + m.clinicRepeatGain)}</div>
+                    <div style={{ fontSize: 10, color: "#71717a", marginTop: 2 }}>{fmtNum(m.newPatients + m.repeatVisits)} patients \u00d7 {fmtFull(m.clinicNetPerVoucher)}</div>
+                    <div style={{ fontSize: 9, color: "#52525b", marginTop: 2 }}>Was earning R0 on these slots</div>
+                  </div>
+                  <div style={{ fontSize: 24, color: "#52525b", fontWeight: 300 }}>\u2212</div>
+                  <div style={{ textAlign: "center", padding: 12, background: "rgba(239,68,68,0.06)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 8 }}>
+                    <div style={{ fontSize: 10, color: "#ef4444", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>COST: Cannibalization</div>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: "#ef4444", fontFamily: "var(--mono)" }}>\u2212{fmt(m.clinicCannibLoss)}</div>
+                    <div style={{ fontSize: 10, color: "#71717a", marginTop: 2 }}>{fmtNum(m.cannibalized)} patients \u00d7 {fmtFull(m.clinicCannibLossPerPatient)} lost</div>
+                    <div style={{ fontSize: 9, color: "#52525b", marginTop: 2 }}>Cash patients who switch to voucher</div>
+                  </div>
+                  <div style={{ fontSize: 24, color: "#52525b", fontWeight: 300 }}>=</div>
+                  <div style={{ textAlign: "center", padding: 12, background: m.clinicNetImpact >= 0 ? "rgba(16,185,129,0.1)" : "rgba(239,68,68,0.1)", border: `2px solid ${m.clinicNetImpact >= 0 ? "rgba(16,185,129,0.4)" : "rgba(239,68,68,0.4)"}`, borderRadius: 8 }}>
+                    <div style={{ fontSize: 10, color: m.clinicNetImpact >= 0 ? "#10b981" : "#ef4444", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>NET IMPACT</div>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: m.clinicNetImpact >= 0 ? "#10b981" : "#ef4444", fontFamily: "var(--mono)" }}>{m.clinicNetImpact >= 0 ? "+" : ""}{fmt(m.clinicNetImpact)}</div>
+                    <div style={{ fontSize: 10, color: "#71717a", marginTop: 2 }}>per month</div>
+                  </div>
                 </div>
-              </Block>
 
-              <div style={{ background: "#18181b", border: "1px solid #27272a", borderRadius: 8, padding: 14 }}>
-                <div style={{ fontSize: 11, color: "#a1a1aa", lineHeight: 1.6 }}>
-                  <strong style={{ color: "#fafafa" }}>Key insight:</strong> With {fmtNum(monthlyConsults)} monthly consultations across 225 clinics, 
-                  even a modest {adoptionPct}% adoption rate gives us {fmtNum(m.monthlyVouchersSold)} vouchers/month.
-                  At {fmtFull(m.netRevPerVoucher)} net per voucher, Carewallet earns {fmt(m.monthlyNetRev)} against a {fmt(m.totalMonthlyCostZAR)} burn.
-                  {m.monthlyProfit > 0 
-                    ? <span style={{ color: "#10b981" }}> That's profitable from day one.</span>
-                    : <span style={{ color: "#f59e0b" }}> Needs {pct((m.totalMonthlyCostZAR / m.netRevPerVoucher) / monthlyConsults)} adoption to break even.</span>
-                  }
+                <div style={{ background: "#0c0c0e", borderRadius: 6, padding: 12, border: "1px solid #27272a" }}>
+                  <div style={{ fontSize: 11, color: "#a1a1aa", lineHeight: 1.6 }}>
+                    <strong style={{ color: "#fafafa" }}>Why it works:</strong> The clinic has {fmtNum(m.emptySlots)} empty slots earning R0 today.
+                    Filling {emptySlotFillPct}% of those at {fmtFull(m.clinicNetPerVoucher)} each = <span style={{ color: "#10b981" }}>+{fmt(m.clinicNewGain)}</span> in pure incremental revenue.
+                    Even after the {fmtFull(m.clinicCannibLoss)} cannibalization cost ({cannibalizationPct}% of cash patients switching),
+                    the net impact is <strong style={{ color: m.clinicNetImpact >= 0 ? "#10b981" : "#ef4444" }}>{m.clinicNetImpact >= 0 ? "+" : ""}{fmt(m.clinicNetImpact)}/month</strong>.
+                  </div>
                 </div>
               </div>
             </Block>
+
+            {/* Profitability target */}
+            <div style={{
+              background: "rgba(16,185,129,0.06)",
+              border: "2px solid rgba(16,185,129,0.3)",
+              borderRadius: 10, padding: 20, textAlign: "center",
+            }}>
+              <div style={{ fontSize: 11, color: "#10b981", textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>To hit profitability, Carewallet needs</div>
+              <div style={{ fontSize: 36, fontWeight: 800, color: "#fafafa", fontFamily: "var(--mono)" }}>
+                {m.breakEvenVouchers < Infinity ? fmtNum(m.breakEvenVouchers) : "\u2014"}
+              </div>
+              <div style={{ fontSize: 12, color: "#a1a1aa" }}>vouchers/month to cover {fmtFull(m.totalMonthlyCostZAR)} burn</div>
+              <div style={{ fontSize: 12, color: "#52525b", marginTop: 6 }}>
+                Currently selling <span style={{ color: m.totalVouchers >= m.breakEvenVouchers ? "#10b981" : "#f59e0b", fontWeight: 700 }}>{fmtNum(m.totalVouchers)}</span> vouchers/month
+                {m.totalVouchers >= m.breakEvenVouchers && <span style={{ color: "#10b981" }}> \u2014 profitable from month 1</span>}
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -487,18 +538,19 @@ export default function CarewalletClinicModel() {
               <div style={{ background: "#18181b", border: "1px solid #27272a", borderRadius: 8, padding: 16 }}>
                 <div style={{ fontSize: 11, color: "#71717a", marginBottom: 10, textTransform: "uppercase", letterSpacing: 0.5 }}>Current State (Cash Only)</div>
                 <div style={{ fontSize: 24, fontWeight: 800, color: "#fafafa", fontFamily: "var(--mono)", marginBottom: 4 }}>{fmt(m.currentMonthlyRevenue)}</div>
-                <div style={{ fontSize: 11, color: "#52525b" }}>{fmtNum(monthlyConsults)} consults × R{cashPrice} avg</div>
+                <div style={{ fontSize: 11, color: "#52525b" }}>{fmtNum(monthlyConsults)} consults \u00d7 R{cashPrice} avg</div>
                 <div style={{ borderTop: "1px solid #27272a", marginTop: 12, paddingTop: 10 }}>
                   {[
-                    "Variable pricing → patient distrust",
+                    "Variable pricing \u2192 patient distrust",
                     "No patient data or CRM",
                     "Zero revenue predictability",
                     "High patient churn, no loyalty",
                     "No digital presence",
-                    "No way to reach lapsed patients",
+                    `~${pct(1 - m.utilization)} of capacity sitting empty`,
+                    "No way to reach lapsed patients from 3M records",
                   ].map((p, i) => (
                     <div key={i} style={{ fontSize: 11, color: "#ef4444", padding: "3px 0", display: "flex", gap: 6 }}>
-                      <span>✗</span><span>{p}</span>
+                      <span>\u2717</span><span>{p}</span>
                     </div>
                   ))}
                 </div>
@@ -507,24 +559,25 @@ export default function CarewalletClinicModel() {
               <div style={{ background: "#18181b", border: "2px solid rgba(16,185,129,0.3)", borderRadius: 8, padding: 16 }}>
                 <div style={{ fontSize: 11, color: "#10b981", marginBottom: 10, textTransform: "uppercase", letterSpacing: 0.5 }}>With Carewallet (Month 12)</div>
                 <div style={{ fontSize: 24, fontWeight: 800, color: "#10b981", fontFamily: "var(--mono)", marginBottom: 4 }}>
-                  {m.months[11] ? fmt(m.months[11].clinicActual) : "—"}
+                  {m.months[11] ? fmt(m.months[11].clinicActual) : "\u2014"}
                 </div>
                 <div style={{ fontSize: 11, color: "#52525b" }}>
-                  {m.months[11] ? (m.months[11].clinicDelta >= 0 
-                    ? `+${fmt(m.months[11].clinicDelta)} vs baseline (${pct(m.month12ClinicPct)} growth)` 
-                    : `${fmt(m.months[11].clinicDelta)} vs baseline`) : "—"}
+                  {m.months[11] ? (m.months[11].clinicDelta >= 0
+                    ? `+${fmt(m.months[11].clinicDelta)} vs baseline (${pct(m.month12ClinicPct)} growth)`
+                    : `${fmt(m.months[11].clinicDelta)} vs baseline`) : "\u2014"}
                 </div>
                 <div style={{ borderTop: "1px solid #27272a", marginTop: 12, paddingTop: 10 }}>
                   {[
                     "Transparent, fixed voucher pricing",
                     "Full patient CRM & visit history",
-                    "Guaranteed pre-paid revenue",
-                    "Voucher lock-in = patient loyalty",
+                    "Guaranteed pre-paid revenue (zero bad debt)",
+                    "Voucher lock-in = patient loyalty (THIS chain only)",
                     "Digital marketplace listing",
+                    "Empty slots filled = pure incremental revenue",
                     "Re-engagement campaigns to lapsed patients",
                   ].map((p, i) => (
                     <div key={i} style={{ fontSize: 11, color: "#10b981", padding: "3px 0", display: "flex", gap: 6 }}>
-                      <span>✓</span><span>{p}</span>
+                      <span>\u2713</span><span>{p}</span>
                     </div>
                   ))}
                 </div>
@@ -532,25 +585,25 @@ export default function CarewalletClinicModel() {
             </div>
           </Block>
 
-          <Block title="CLINIC PROFIT PER VOUCHER PATIENT" accent="#3b82f6">
+          <Block title="CLINIC ECONOMICS: VOUCHER vs EMPTY CHAIR" accent="#3b82f6">
             <div style={{ background: "#18181b", border: "1px solid #27272a", borderRadius: 8, padding: 16 }}>
               <div style={{ fontSize: 12, color: "#a1a1aa", marginBottom: 12, lineHeight: 1.6 }}>
-                Yes, the clinic receives <strong style={{ color: "#ef4444" }}>{fmtFull(m.clinicRevenuePerConsultVoucher)}</strong> per voucher consult vs <strong>{fmtFull(cashPrice)}</strong> cash.
-                But here's why the trade-off works:
+                The clinic receives <strong style={{ color: "#10b981" }}>{fmtFull(m.clinicNetPerVoucher)}</strong> per voucher consult vs <strong>{fmtFull(cashPrice)}</strong> cash.
+                But voucher patients are filling <strong style={{ color: "#f59e0b" }}>empty chairs</strong> \u2014 the clinic was earning R0 on those slots.
               </div>
 
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
                 {[
                   {
-                    title: "Repeat Visits ↑",
-                    metric: "+8-15%",
-                    desc: "Voucher holders visit more frequently. Pre-paid = zero friction to return.",
+                    title: "Empty \u2192 Filled",
+                    metric: fmtNum(m.emptySlots),
+                    desc: `${fmtNum(m.emptySlots)} empty slots/month. Each filled slot at ${fmtFull(m.clinicNetPerVoucher)} is pure incremental revenue vs R0 today.`,
                     color: "#10b981",
                   },
                   {
                     title: "New Patients",
-                    metric: "+12%",
-                    desc: "Lower price attracts patients who previously couldn't afford private care.",
+                    metric: `+${fmtNum(m.newPatients)}`,
+                    desc: "Lapsed patients from 3M records, uninsured community members, and public clinic patients who'd switch at the lower price.",
                     color: "#3b82f6",
                   },
                   {
@@ -560,21 +613,21 @@ export default function CarewalletClinicModel() {
                     color: "#f59e0b",
                   },
                   {
-                    title: "Capacity Fill",
-                    metric: "~{avg}".replace("{avg}", Math.round(monthlyConsults / clinicCount / 22).toString()) + "/day",
-                    desc: "Currently ~" + Math.round(monthlyConsults / clinicCount / 22) + " consults/day per clinic. Vouchers fill empty slots.",
+                    title: "Repeat Visits \u2191",
+                    metric: `+${fmtNum(m.repeatVisits)}`,
+                    desc: "Voucher holders visit 8% more frequently. Pre-paid = zero friction to return.",
                     color: "#a855f7",
                   },
                   {
-                    title: "Data Value",
-                    metric: "3M+",
-                    desc: "Historic records become actionable: predict demand, personalize care, reduce waste.",
-                    color: "#ec4899",
+                    title: "Cannibalization",
+                    metric: `${cannibalizationPct}%`,
+                    desc: `Only ${fmtNum(m.cannibalized)} cash patients switch. Controlled cost of ${fmt(m.clinicCannibLoss)}/mo \u2014 dwarfed by new patient gains.`,
+                    color: "#ef4444",
                   },
                   {
                     title: "Brand Lock-in",
                     metric: "Exclusive",
-                    desc: "Vouchers tied to THIS chain only. Patients can't redeem at competitors.",
+                    desc: "Vouchers tied to THIS chain only. Patients can't redeem at competitors. CRM + data value included.",
                     color: "#06b6d4",
                   },
                 ].map((item, i) => (
@@ -587,11 +640,11 @@ export default function CarewalletClinicModel() {
               </div>
 
               <div style={{ marginTop: 16, background: "rgba(16,185,129,0.06)", border: "1px solid rgba(16,185,129,0.2)", borderRadius: 6, padding: 12 }}>
-                <div style={{ fontSize: 12, fontWeight: 700, color: "#10b981", marginBottom: 4 }}>The math on lower margin + higher volume:</div>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#10b981", marginBottom: 4 }}>The capacity argument:</div>
                 <div style={{ fontSize: 11, color: "#a1a1aa", lineHeight: 1.6 }}>
-                  A clinic doing {Math.round(monthlyConsults / clinicCount)} consults/month at R{cashPrice} cash = {fmt(Math.round(monthlyConsults / clinicCount) * cashPrice)}/month.
-                  With {adoptionPct}% voucher adoption + 12% new patients + 8% repeat uplift, total volume grows while per-unit margin adjusts.
-                  By month 12, the net effect on revenue is <strong style={{ color: m.month12ClinicPct >= 0 ? "#10b981" : "#f59e0b" }}>{pct(m.month12ClinicPct)}</strong>.
+                  {clinicCount} clinics at {pct(m.utilization)} utilization = {fmtNum(m.emptySlots)} empty slots/month earning nothing.
+                  Filling {emptySlotFillPct}% of those adds {fmtNum(m.newPatients)} new patients at {fmtFull(m.clinicNetPerVoucher)} each.
+                  Net monthly impact after {cannibalizationPct}% cannibalization: <strong style={{ color: m.clinicNetImpact >= 0 ? "#10b981" : "#f59e0b" }}>{m.clinicNetImpact >= 0 ? "+" : ""}{fmt(m.clinicNetImpact)}</strong>.
                 </div>
               </div>
             </div>
@@ -603,7 +656,6 @@ export default function CarewalletClinicModel() {
       {tab === "projection" && (
         <>
           <Block title="CLINIC CHAIN REVENUE: BASELINE vs WITH CAREWALLET">
-            {/* Revenue comparison chart */}
             <div style={{ background: "#18181b", border: "1px solid #27272a", borderRadius: 8, padding: 16, marginBottom: 16 }}>
               <div style={{ display: "flex", gap: 16, marginBottom: 12, fontSize: 11 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -620,9 +672,7 @@ export default function CarewalletClinicModel() {
                 </div>
               </div>
 
-              {/* Chart area */}
               <div style={{ height: 240, display: "flex", alignItems: "flex-end", gap: 4, position: "relative", paddingLeft: 60, paddingBottom: 24 }}>
-                {/* Y-axis labels */}
                 {[0, 0.25, 0.5, 0.75, 1].map((pctY, i) => {
                   const val = maxClinicRev * pctY;
                   return (
@@ -637,7 +687,6 @@ export default function CarewalletClinicModel() {
                   );
                 })}
 
-                {/* Grid lines */}
                 {[0.25, 0.5, 0.75, 1].map((pctY, i) => (
                   <div key={i} style={{
                     position: "absolute",
@@ -647,13 +696,11 @@ export default function CarewalletClinicModel() {
                   }} />
                 ))}
 
-                {/* Bars */}
                 {m.months.map((mo, i) => {
                   const baseH = (mo.clinicBaseline / maxClinicRev) * 216;
                   const actualH = (mo.clinicActual / maxClinicRev) * 216;
                   return (
                     <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "flex-end", alignItems: "center", height: 216, position: "relative" }}>
-                      {/* Actual bar */}
                       <div style={{
                         width: "80%",
                         height: actualH,
@@ -661,7 +708,6 @@ export default function CarewalletClinicModel() {
                         position: "relative",
                         overflow: "hidden",
                       }}>
-                        {/* Baseline portion */}
                         <div style={{
                           position: "absolute",
                           bottom: 0,
@@ -669,7 +715,6 @@ export default function CarewalletClinicModel() {
                           height: baseH,
                           background: "#27272a",
                         }} />
-                        {/* Uplift portion */}
                         <div style={{
                           position: "absolute",
                           bottom: baseH,
@@ -679,14 +724,12 @@ export default function CarewalletClinicModel() {
                           borderTop: "2px solid #10b981",
                         }} />
                       </div>
-                      {/* Month label */}
                       <div style={{ fontSize: 9, color: "#52525b", marginTop: 4, fontFamily: "var(--mono)" }}>M{mo.month}</div>
                     </div>
                   );
                 })}
               </div>
 
-              {/* Summary below chart */}
               <div style={{ display: "flex", gap: 12, marginTop: 16 }}>
                 <Stat label="Year 1 Baseline Revenue" value={fmt(m.months.reduce((s, x) => s + x.clinicBaseline, 0))} color="#71717a" />
                 <Stat label="Year 1 With Carewallet" value={fmt(m.months.reduce((s, x) => s + x.clinicActual, 0))} color="#10b981" />
@@ -700,7 +743,7 @@ export default function CarewalletClinicModel() {
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10, fontFamily: "var(--mono)" }}>
                 <thead>
                   <tr style={{ borderBottom: "2px solid #27272a" }}>
-                    {["Mo", "Adopt%", "Voucher Users", "V. Sold", "New Patients", "Repeats", "Clinic Baseline", "Clinic Actual", "Δ Revenue", "CW Profit", "CW Cum P&L"].map(h => (
+                    {["Mo", "Fill%", "New Patients", "Cannib.", "Repeats", "Total V.", "Clinic Baseline", "Clinic Actual", "\u0394 Revenue", "CW Profit", "CW Cum P\u0026L"].map(h => (
                       <th key={h} style={{ padding: "6px 4px", textAlign: "right", color: "#52525b", fontWeight: 600, fontSize: 9 }}>{h}</th>
                     ))}
                   </tr>
@@ -709,11 +752,11 @@ export default function CarewalletClinicModel() {
                   {m.months.map(mo => (
                     <tr key={mo.month} style={{ borderTop: "1px solid #1a1a1e", background: mo.cwProfit > 0 ? "rgba(16,185,129,0.02)" : "transparent" }}>
                       <td style={{ padding: "5px 4px", textAlign: "right", color: "#e4e4e7", fontWeight: 700 }}>{mo.month}</td>
-                      <td style={{ padding: "5px 4px", textAlign: "right", color: "#a1a1aa" }}>{mo.adoptPct.toFixed(1)}%</td>
-                      <td style={{ padding: "5px 4px", textAlign: "right", color: "#a1a1aa" }}>{fmtNum(mo.voucherUsers)}</td>
-                      <td style={{ padding: "5px 4px", textAlign: "right", color: "#f59e0b" }}>{fmtNum(mo.vouchersSold)}</td>
-                      <td style={{ padding: "5px 4px", textAlign: "right", color: "#3b82f6" }}>+{fmtNum(mo.newPatients)}</td>
-                      <td style={{ padding: "5px 4px", textAlign: "right", color: "#a855f7" }}>+{fmtNum(mo.repeatUplift)}</td>
+                      <td style={{ padding: "5px 4px", textAlign: "right", color: "#a1a1aa" }}>{mo.fillPct.toFixed(1)}%</td>
+                      <td style={{ padding: "5px 4px", textAlign: "right", color: "#10b981" }}>{fmtNum(mo.newPatients)}</td>
+                      <td style={{ padding: "5px 4px", textAlign: "right", color: "#ef4444" }}>{fmtNum(mo.cannibalized)}</td>
+                      <td style={{ padding: "5px 4px", textAlign: "right", color: "#a855f7" }}>+{fmtNum(mo.repeatVisits)}</td>
+                      <td style={{ padding: "5px 4px", textAlign: "right", color: "#f59e0b" }}>{fmtNum(mo.totalVouchers)}</td>
                       <td style={{ padding: "5px 4px", textAlign: "right", color: "#71717a" }}>{fmt(mo.clinicBaseline)}</td>
                       <td style={{ padding: "5px 4px", textAlign: "right", color: "#10b981" }}>{fmt(mo.clinicActual)}</td>
                       <td style={{ padding: "5px 4px", textAlign: "right", color: mo.clinicDelta >= 0 ? "#10b981" : "#ef4444", fontWeight: 600 }}>
@@ -745,19 +788,19 @@ export default function CarewalletClinicModel() {
                 {[
                   {
                     q: "1. What should vouchers sell for?",
-                    a: `R${voucherPrice} — a ${pct(m.consumerDiscountPct)} discount off the R${cashPrice} cash price. This sits in the proven 20-33% discount range that Discovery and Unu have validated in the SA market.`,
+                    a: `R${voucherPrice} \u2014 a ${pct(m.consumerDiscountPct)} discount off the R${cashPrice} cash price. This sits in the proven 20-33% discount range that Discovery and Unu have validated in the SA market.`,
                   },
                   {
-                    q: "2. How many users need to buy?",
-                    a: `Just ${m.netRevPerVoucher > 0 ? fmtNum(Math.ceil(m.totalMonthlyCostZAR / m.netRevPerVoucher)) : "—"} vouchers/month covers Carewallet's entire cost base. That's ${m.netRevPerVoucher > 0 ? pct(Math.ceil(m.totalMonthlyCostZAR / m.netRevPerVoucher) / monthlyConsults) : "—"} of the chain's monthly volume — a trivially small fraction.`,
+                    q: "2. Who buys vouchers?",
+                    a: `People who can't afford R${cashPrice} cash \u2014 the 84% uninsured population, lapsed patients from the 3M records, and community members currently using public clinics. These fill empty slots. Only ~${cannibalizationPct}% of existing cash patients switch.`,
                   },
                   {
-                    q: "3. How frequently do they buy?",
-                    a: `${vouchersPerUserMonth} voucher${vouchersPerUserMonth > 1 ? "s" : ""} per user per month. SA data shows the uninsured average 3.2 GP visits/year. Voucher programs increase this because pre-payment removes the friction of deciding to spend.`,
+                    q: "3. What does the clinic gain?",
+                    a: `~${fmtNum(m.newPatients)} new patients/month at ${fmtFull(m.clinicNetPerVoucher)} each = ~${fmt(m.clinicNewGain)} incremental revenue. Minus ~${fmt(m.clinicCannibLoss)} cannibalization = net ${m.clinicNetImpact >= 0 ? "+" : ""}${fmt(m.clinicNetImpact)}/month. Plus CRM, patient data, and digital presence they don't currently have.`,
                   },
                   {
-                    q: "4. Clinic monthly profit impact?",
-                    a: `By month 12, the clinic chain sees ${m.months[11]?.clinicDelta >= 0 ? "+" : ""}${fmt(m.months[11]?.clinicDelta || 0)} per month versus doing nothing. Over 12 months, cumulative impact: ${m.year1ClinicUplift >= 0 ? "+" : ""}${fmt(m.year1ClinicUplift)}.`,
+                    q: "4. What does Carewallet earn?",
+                    a: `${fmtFull(m.netRevPerVoucher)} net per voucher \u00d7 ~${fmtNum(m.totalVouchers)} vouchers = ~${fmt(m.monthlyNetRev)}/month. Break-even at just ~${fmtNum(m.breakEvenVouchers)} vouchers against ${fmtFull(m.totalMonthlyCostZAR)} monthly burn.${m.monthlyProfit > 0 ? " Profitable from month 1." : ""}`,
                   },
                 ].map((item, i) => (
                   <div key={i} style={{ marginBottom: 16 }}>
@@ -775,29 +818,28 @@ export default function CarewalletClinicModel() {
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 16 }}>
                   <Stat label="Voucher Price" value={`R${voucherPrice}`} color="#3b82f6" />
                   <Stat label="Consumer Saves" value={pct(m.consumerDiscountPct)} color="#10b981" />
-                  <Stat label="Clinic Gets" value={fmtFull(gpPayoutRate - m.platformFee)} sub="per voucher redemption" color="#a855f7" />
+                  <Stat label="Clinic Gets" value={fmtFull(m.clinicNetPerVoucher)} sub="per voucher redemption" color="#a855f7" />
                   <Stat label="CW Earns" value={fmtFull(m.netRevPerVoucher)} sub="net per voucher" color="#f59e0b" />
-                  <Stat label="CW Break-even" value={m.breakEvenMonth ? `Month ${m.breakEvenMonth}` : "—"} color="#10b981" />
+                  <Stat label="CW Break-even" value={`${fmtNum(m.breakEvenVouchers)} vouchers`} color="#10b981" />
                   <Stat label="CW Year 1 Profit" value={fmt(m.year1CWProfit)} color={m.year1CWProfit > 0 ? "#10b981" : "#ef4444"} />
                 </div>
 
                 <div style={{ background: "#0c0c0e", borderRadius: 8, padding: 14, border: "1px solid #27272a" }}>
                   <div style={{ fontSize: 11, fontWeight: 700, color: "#fafafa", marginBottom: 8 }}>Why this works for the clinic chain:</div>
                   <div style={{ fontSize: 11, color: "#a1a1aa", lineHeight: 1.7 }}>
-                    225 clinics doing {fmtNum(monthlyConsults)} consultations/month with 3M+ historic records sitting unused.
-                    Carewallet turns those records into a re-engagement engine: lapsed patients get voucher offers, 
-                    active patients get loyalty pricing, and the chain gets guaranteed pre-paid revenue instead of 
-                    unpredictable cash flow. The 10% platform fee funds CRM tools, booking infrastructure, and 
-                    patient analytics that the chain doesn't currently have — at a fraction of what building it 
-                    internally would cost.
+                    {clinicCount} clinics running at {pct(m.utilization)} utilization = {fmtNum(m.emptySlots)} empty slots every month earning nothing.
+                    Carewallet fills those slots with voucher patients from the 3M lapsed records and the uninsured community.
+                    The clinic earns {fmtFull(m.clinicNetPerVoucher)} per new visit (vs R0 today). Cannibalization is controlled at {cannibalizationPct}%
+                    and more than offset by new patient revenue. The {platformFeePct}% platform fee funds CRM tools, booking infrastructure,
+                    and patient analytics that the chain doesn't currently have \u2014 at a fraction of what building it internally would cost.
                   </div>
                 </div>
 
                 <div style={{ marginTop: 16, background: "rgba(59,130,246,0.06)", borderRadius: 8, padding: 14, border: "1px solid rgba(59,130,246,0.2)" }}>
                   <div style={{ fontSize: 11, fontWeight: 700, color: "#3b82f6", marginBottom: 6 }}>Regulatory advantage</div>
                   <div style={{ fontSize: 11, color: "#a1a1aa", lineHeight: 1.6 }}>
-                    Health vouchers in South Africa are unregulated — they fall outside both medical scheme and 
-                    insurance legislation. Discovery, Netcare, and CareWorks all operate voucher programs without 
+                    Health vouchers in South Africa are unregulated \u2014 they fall outside both medical scheme and
+                    insurance legislation. Discovery, Netcare, and CareWorks all operate voucher programs without
                     additional licensing. Carewallet inherits this same regulatory clarity.
                   </div>
                 </div>
@@ -813,15 +855,16 @@ export default function CarewalletClinicModel() {
           }}>
             <div style={{ fontSize: 10, color: "#10b981", textTransform: "uppercase", letterSpacing: 2, marginBottom: 8 }}>The ask</div>
             <div style={{ fontSize: 16, color: "#fafafa", fontWeight: 600, lineHeight: 1.5 }}>
-              "Let us turn your 225 clinics and 3M patient records into a voucher-powered 
-              retainership platform — at zero upfront cost. We earn only when your patients buy."
+              "Your {clinicCount} clinics have {fmtNum(m.emptySlots)} empty slots every month. Let us fill them with voucher patients
+              from your 3M records and the uninsured community \u2014 at zero upfront cost. You earn {fmtFull(m.clinicNetPerVoucher)} per
+              new visit. We earn only when your patients buy."
             </div>
           </div>
         </>
       )}
 
       <div style={{ textAlign: "center", padding: "20px 0 8px", borderTop: "1px solid #1a1a1e", marginTop: 24, fontSize: 9, color: "#3f3f46" }}>
-        Carewallet Business Case · Clinic Chain Partnership Model · All figures in ZAR · March 2026
+        Carewallet Business Case \u00b7 Capacity-Based Model (v2) \u00b7 Clinic Chain Partnership \u00b7 All figures in ZAR \u00b7 March 2026
       </div>
     </div>
   );
