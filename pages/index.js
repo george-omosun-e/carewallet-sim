@@ -222,8 +222,6 @@ export default function CarewalletClinicModel() {
       fontFamily: "var(--sans)",
       padding: "16px",
     }}>
-      <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-
       {/* Header */}
       <div style={{ borderBottom: "1px solid #27272a", paddingBottom: 16, marginBottom: 20 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
